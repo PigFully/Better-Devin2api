@@ -1,0 +1,595 @@
+// 本文件验证 logs 表的读路径：SearchLogs 的结构化筛选与分页计数、
+// UsageStats 的延迟分位数/限流采样/SLA 归因/10 分钟桶网格。
+package store
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"testing"
+	"time"
+)
+
+// TestSearchLogsFilters 验证 LogQuery 各筛选维度的下推语义与
+// total（独立标量计数，分页前的精确命中数）。
+func TestSearchLogsFilters(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	for i, r := range []*LogRow{
+		{StartedAt: now, Method: "POST", Path: "/v1/messages", StatusCode: 200, Result: "completed", Model: "m-a"},
+		{StartedAt: now, Method: "POST", Path: "/v1/messages", StatusCode: 400, Result: "failed", Model: "m-b", ErrorStage: "http_decode"},
+		{StartedAt: now, Method: "POST", Path: "/v1/messages", StatusCode: 500, Result: "failed", Model: "m-a", ErrorStage: "provider_stream"},
+	} {
+		r.Dir = fmt.Sprintf("d-%d", i)
+		if _, err := s.InsertLog(ctx, r); err != nil {
+			t.Fatalf("InsertLog %d: %v", i, err)
+		}
+	}
+
+	rows, total, err := s.SearchLogs(ctx, LogQuery{StatusClass: "4xx"})
+	if err != nil || len(rows) != 1 || rows[0].Model != "m-b" {
+		t.Fatalf("status_class=4xx = %v/%v err=%v", rows, total, err)
+	}
+	// status 表达式：精确/取反/比较/段位/逗号 OR；非法表达式不匹配任何条目。
+	for _, tc := range []struct {
+		expr string
+		want int
+	}{
+		{"400", 1}, {"!200", 2}, {">=400", 2}, {"<300", 1}, {"4xx", 1},
+		{"400,500", 2}, {"!2xx", 2}, {"garbage", 0}, {">=4xx", 0},
+	} {
+		rows, _, err := s.SearchLogs(ctx, LogQuery{StatusExpr: tc.expr})
+		if err != nil || len(rows) != tc.want {
+			t.Fatalf("status=%q = %d 条, want %d (err=%v)", tc.expr, len(rows), tc.want, err)
+		}
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{Model: "m-a"}); len(rows) != 2 {
+		t.Fatalf("model=m-a = %+v", rows)
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{ErrorStage: "provider_stream"}); len(rows) != 1 {
+		t.Fatalf("error_stage = %+v", rows)
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{Result: "completed"}); len(rows) != 1 {
+		t.Fatalf("result=completed = %+v", rows)
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{SinceMS: now.Add(time.Hour).UnixMilli()}); len(rows) != 0 {
+		t.Fatalf("since future = %+v", rows)
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{UntilMS: now.Add(-time.Hour).UnixMilli()}); len(rows) != 0 {
+		t.Fatalf("until past = %+v", rows)
+	}
+	if rows, _, _ := s.SearchLogs(ctx, LogQuery{UntilMS: now.Add(time.Hour).UnixMilli()}); len(rows) != 3 {
+		t.Fatalf("until future = %+v", rows)
+	}
+	// 倒序同刻按 id 打破平局：最后插入的在前。
+	rows, _, err = s.SearchLogs(ctx, LogQuery{})
+	if err != nil || len(rows) != 3 || rows[0].Dir != "d-2" {
+		t.Fatalf("order = %+v err=%v", rows, err)
+	}
+	// limit 用尽时 total 仍报命中总数——面板据此推 has_more。
+	rows, total, err = s.SearchLogs(ctx, LogQuery{Limit: 1})
+	if err != nil || len(rows) != 1 || total != 3 {
+		t.Fatalf("limit=1 = %d rows total=%d err=%v, want 1/3", len(rows), total, err)
+	}
+}
+
+// TestUsageLatencyPercentiles 验证分位数口径（pick=sorted[q*(n-1)]）与
+// 样本上限：超过 usageSampleCapacity 后只留最近 N 条。
+func TestUsageLatencyPercentiles(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	for i := 1; i <= 100; i++ {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("p-%d", i), StartedAt: now, DurationMS: int64(i), Result: "completed",
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	lat, err := s.LogLatency(ctx)
+	if err != nil {
+		t.Fatalf("LogLatency: %v", err)
+	}
+	stats := lat["duration"]
+	if stats.P50 != 50 || stats.P95 != 95 || stats.P99 != 99 || stats.Max != 100 {
+		t.Fatalf("percentiles = %+v", stats)
+	}
+	for i := 0; i < usageSampleCapacity; i++ {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("c-%d", i), StartedAt: now, DurationMS: 1, Result: "completed",
+		}); err != nil {
+			t.Fatalf("InsertLog cap: %v", err)
+		}
+	}
+	lat, err = s.LogLatency(ctx)
+	if err != nil {
+		t.Fatalf("LogLatency: %v", err)
+	}
+	if stats = lat["duration"]; stats.Samples != usageSampleCapacity || stats.P50 != 1 {
+		t.Fatalf("capped samples = %+v, want %d/p50=1", stats, usageSampleCapacity)
+	}
+}
+
+// TestUsageRateLimitEvents 验证上游 429 的计数与「完成时刻前 60s 内启动
+// 请求数」的 RPM 采样。
+func TestUsageRateLimitEvents(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	base := time.Now()
+	row := func(dir string, off time.Duration, status int, durMS int64) *LogRow {
+		return &LogRow{Dir: dir, StartedAt: base.Add(off), DurationMS: durMS,
+			StatusCode: status, Result: "completed", Model: "m-a"}
+	}
+	rows := []*LogRow{
+		row("rl-120", -120*time.Second, 200, 100), // 在 429 的 60s 窗口之外
+		row("rl-30", -30*time.Second, 200, 100),
+		row("rl-20", -20*time.Second, 200, 100),
+		row("rl-10", -10*time.Second, 200, 100),
+		// end = -5s+2s = -3s；窗口 (-63s,-3s] 内含 -30/-20/-10/-5 共 4 个 start。
+		row("rl-5", -5*time.Second, 429, 2000),
+	}
+	rows[len(rows)-1].ErrorStage = "rate_gate"
+	for _, r := range rows {
+		if _, err := s.InsertLog(ctx, r); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if snap.Window.RateLimited != 1 {
+		t.Fatalf("window rate_limited = %d", snap.Window.RateLimited)
+	}
+	if len(snap.RateLimitEvents) != 1 {
+		t.Fatalf("rate_limit_events = %+v", snap.RateLimitEvents)
+	}
+	ev := snap.RateLimitEvents[0]
+	if ev.Model != "m-a" || ev.RPM != 4 || ev.At != base.Unix()-3 || ev.Stage != "rate_gate" {
+		t.Fatalf("event = %+v", ev)
+	}
+	if len(snap.Models) != 1 || snap.Models[0].RateLimited != 1 {
+		t.Fatalf("model agg = %+v", snap.Models)
+	}
+}
+
+// TestUsageFaults 验证失败责任归因的聚合口径：客户端责任（断连、请求体
+// 阶段失败）与 429 限流分列，只有服务端失分计 upstream_faults。
+func TestUsageFaults(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	add := func(i, status int, result, stage string) {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("f-%d", i), StartedAt: now, DurationMS: 10,
+			StatusCode: status, Result: result, ErrorStage: stage, Model: "m-x",
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	add(0, 200, "completed", "")
+	add(1, 200, "completed", "")
+	add(2, 429, "failed", "devin_connect")
+	add(3, 200, "disconnected", "")
+	add(4, 400, "failed", "http_decode")
+	add(5, 500, "failed", "provider_stream")
+
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.Models) != 1 {
+		t.Fatalf("models = %+v", snap.Models)
+	}
+	m := snap.Models[0]
+	if m.ClientFaults != 2 || m.UpstreamFaults != 1 || m.RateLimited != 1 {
+		t.Fatalf("faults = %+v", m)
+	}
+	if snap.Window.ClientFaults != 2 || snap.Window.UpstreamFaults != 1 {
+		t.Fatalf("window = %+v", snap.Window)
+	}
+	var sumClient, sumUpstream int64
+	for _, p := range snap.Points {
+		sumClient += p.ClientFaults
+		sumUpstream += p.UpstreamFaults
+	}
+	if sumClient != 2 || sumUpstream != 1 {
+		t.Fatalf("points faults = %d/%d", sumClient, sumUpstream)
+	}
+}
+
+// TestUsageMinBucketWraparound 验证 8 天网格的边界：早于保留窗的条目仍
+// 计入窗口 totals，但不落任何 10 分钟桶——当前桶数据不被覆盖。points
+// 是稀疏序列：只有当前行落桶，len=1 而非完整网格。
+func TestUsageMinBucketWraparound(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(10 * time.Minute)
+	if _, err := s.InsertLog(ctx, &LogRow{
+		Dir: "cur", StartedAt: now, DurationMS: 5, Result: "completed", InputTokens: 7,
+	}); err != nil {
+		t.Fatalf("InsertLog: %v", err)
+	}
+	// 恰好 usageMinBuckets 个桶（8 天）之前的条目落在网格窗口之外。
+	old := now.Add(-usageMinBuckets * 10 * time.Minute)
+	if _, err := s.InsertLog(ctx, &LogRow{
+		Dir: "old", StartedAt: old, DurationMS: 9, Result: "completed", InputTokens: 3,
+	}); err != nil {
+		t.Fatalf("InsertLog old: %v", err)
+	}
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if snap.Window.Requests != 2 || snap.Window.InputTokens != 10 {
+		t.Fatalf("window = %+v", snap.Window)
+	}
+	if len(snap.Points) != 1 {
+		t.Fatalf("points len = %d, want 1（稀疏序列只有当前桶）", len(snap.Points))
+	}
+	current := snap.Points[len(snap.Points)-1]
+	if current.At != now.Unix()/600*600 || current.Requests != 1 || current.InputTokens != 7 {
+		t.Fatalf("current bucket = %+v, want at=%d requests=1 input=7", current, now.Unix()/600*600)
+	}
+}
+
+// TestUsagePointsSparse 验证 points 的稀疏编码：零流量桶不进序列，
+// 非零桶在 JSON 里只发非零字段（at 恒在）。消费侧按缺省 0 求和，
+// 合计口径与稠密编码一致。
+func TestUsagePointsSparse(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(10 * time.Minute)
+	// 两个相隔 1 小时的非零桶，中间 5 个零桶不应出现。
+	for i, off := range []time.Duration{0, -time.Hour} {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("sp-%d", i), StartedAt: now.Add(off), Result: "completed", InputTokens: int64(10 + i),
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.Points) != 2 {
+		t.Fatalf("sparse points len = %d, want 2", len(snap.Points))
+	}
+	// 旧到新排序保留；首尾 at 相隔恰好 1 小时。
+	if snap.Points[1].At-snap.Points[0].At != 3600 {
+		t.Fatalf("points at = %d/%d, want 相隔 3600s", snap.Points[0].At, snap.Points[1].At)
+	}
+	raw, err := json.Marshal(snap.Points[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]int64
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["requests"] != 1 || m["input_tokens"] != 10 {
+		t.Fatalf("nonzero fields = %v", m)
+	}
+	for _, k := range []string{"errors", "disconnected", "rate_limited", "output_tokens", "gen_ms"} {
+		if _, ok := m[k]; ok {
+			t.Fatalf("zero field %q should be omitted: %v", k, m)
+		}
+	}
+	if _, ok := m["at"]; !ok {
+		t.Fatal("at must always be emitted")
+	}
+}
+
+// TestAccountAggsFold 验证按号分组聚合的折叠口径：” 与 'default' 行
+// 合流进 default 桶（对齐 QuotaReport ”→default），不出三群幽灵桶。
+func TestAccountAggsFold(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	fup := func(v int64) *int64 { return &v }
+	rows := []*LogRow{
+		{Dir: "ag-e0", StartedAt: now, DurationMS: 100, StatusCode: 200, Result: "completed", Account: "", FirstUpstreamMS: fup(10)},
+		{Dir: "ag-e1", StartedAt: now, DurationMS: 300, StatusCode: 200, Result: "completed", Account: "", FirstUpstreamMS: fup(30)},
+		{Dir: "ag-d0", StartedAt: now, DurationMS: 200, StatusCode: 200, Result: "completed", Account: "default", FirstUpstreamMS: fup(20)},
+		{Dir: "ag-yj", StartedAt: now, DurationMS: 500, StatusCode: 200, Result: "completed", Account: "alpha", FirstUpstreamMS: fup(50)},
+	}
+	for _, r := range rows {
+		if _, err := s.InsertLog(ctx, r); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+
+	aggs, err := s.accountAggs(ctx)
+	if err != nil {
+		t.Fatalf("AccountAggs: %v", err)
+	}
+	if len(aggs) != 2 {
+		t.Fatalf("dims = %+v, want default+alpha 两桶", aggs)
+	}
+	byName := map[string]DimensionAgg{}
+	for _, d := range aggs {
+		byName[d.Name] = d
+	}
+	def := byName["default"]
+	if def.Requests != 3 || def.AvgDuration != 200 || def.AvgTTFB != 20 {
+		t.Fatalf("default 桶 = %+v, want requests=3 avgDur=200 avgTTFB=20", def)
+	}
+	yj := byName["alpha"]
+	if yj.Requests != 1 || yj.AvgDuration != 500 || yj.AvgTTFB != 50 {
+		t.Fatalf("alpha 桶 = %+v", yj)
+	}
+}
+
+// TestAccountsUsage 验证 AccountsUsage 的原始量：今日计数（requests/ok/
+// non499/tokens）、60s 完成窗聚合（rpm_now/tps_now/cache_rate 原料）、
+// 首字延迟样本分位与均值；并覆盖 'default' 折叠 ” 历史行与零活动名
+// 的零值行保证。
+func TestAccountsUsage(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	yesterday := now.AddDate(0, 0, -1)
+	fup := func(v int64) *int64 { return &v }
+	rows := []*LogRow{
+		// alpha：今日 3 行（200/500/499）+ 昨日 1 行（边界守卫）。
+		{Dir: "u-y1", StartedAt: now, DurationMS: 2000, StatusCode: 200, Result: "completed",
+			Account: "alpha", InputTokens: 30, OutputTokens: 50, CacheReadTokens: 10,
+			TotalTokens: 100, FirstUpstreamMS: fup(100)},
+		{Dir: "u-y2", StartedAt: now, DurationMS: 1000, StatusCode: 500, Result: "failed",
+			Account: "alpha", OutputTokens: 20, TotalTokens: 60},
+		{Dir: "u-y3", StartedAt: now, DurationMS: 500, StatusCode: 499, Result: "disconnected",
+			Account: "alpha"},
+		{Dir: "u-y4", StartedAt: yesterday, DurationMS: 100, StatusCode: 200, Result: "completed",
+			Account: "alpha", TotalTokens: 5},
+		// 别号行——不得漏进 alpha 的 usage。
+		{Dir: "u-r1", StartedAt: now, DurationMS: 800, StatusCode: 200, Result: "completed",
+			Account: "bravo", TotalTokens: 7, FirstUpstreamMS: fup(50)},
+		// '' 与 'default' 两群——折叠后同属 default。
+		{Dir: "u-e1", StartedAt: now, DurationMS: 3000, StatusCode: 200, Result: "completed",
+			Account: "", OutputTokens: 6, TotalTokens: 3, FirstUpstreamMS: fup(10)},
+		{Dir: "u-d1", StartedAt: now, DurationMS: 1000, StatusCode: 200, Result: "completed",
+			Account: "default", OutputTokens: 4, TotalTokens: 2, FirstUpstreamMS: fup(30)},
+	}
+	for _, r := range rows {
+		if _, err := s.InsertLog(ctx, r); err != nil {
+			t.Fatalf("InsertLog %s: %v", r.Dir, err)
+		}
+	}
+
+	usage, err := s.AccountsUsage(ctx, []string{"alpha", "default", "charlie"})
+	if err != nil {
+		t.Fatalf("AccountsUsage: %v", err)
+	}
+	if len(usage) != 3 {
+		t.Fatalf("usage keys = %d, want 3（请求名全覆盖）", len(usage))
+	}
+	row := usage["alpha"]
+	// 今日：3 完成行（含 499），1 个 2xx，2 个非 499，tokens=160。
+	if row.Today.Requests != 3 || row.Today.OK != 1 || row.Today.Non499 != 2 || row.Today.Tokens != 160 {
+		t.Fatalf("today = %+v", row.Today)
+	}
+	// 近窗：非 499 完成数 2（y1+y2）；GenMS=(2000-100)+1000+500=3400
+	//（499 行也计入生成时长分母，与 LogRecentWindow 口径一致）。
+	if row.Recent.Req != 2 || row.Recent.OutTok != 70 || row.Recent.InTok != 30 ||
+		row.Recent.CrTok != 10 || row.Recent.GenMS != 3400 {
+		t.Fatalf("recent = %+v", row.Recent)
+	}
+	// TTFB 样本：alpha 只有 y1 的 100ms。
+	if row.TTFB.Samples != 1 || row.TTFB.P50 != 100 || row.TTFB.P90 != 100 || row.TTFBAvgMS != 100 {
+		t.Fatalf("ttfb = %+v avg=%v", row.TTFB, row.TTFBAvgMS)
+	}
+
+	// 'default' 折叠 ''+'default' 两群（e1+d1）。
+	def := usage["default"]
+	if def.Today.Requests != 2 || def.Today.OK != 2 || def.Today.Tokens != 5 {
+		t.Fatalf("default today = %+v", def.Today)
+	}
+	if def.Recent.Req != 2 || def.Recent.OutTok != 10 || def.Recent.GenMS != 2990+970 {
+		t.Fatalf("default recent = %+v", def.Recent)
+	}
+	// 样本 [10,30]：pick=int(q*(n-1))，p50=p90=sorted[0]=10，均值 20。
+	if def.TTFB.Samples != 2 || def.TTFB.P50 != 10 || def.TTFB.P90 != 10 || def.TTFBAvgMS != 20 {
+		t.Fatalf("default ttfb = %+v avg=%v", def.TTFB, def.TTFBAvgMS)
+	}
+
+	// 零活动名仍回零值行：视图侧数字字段要出 0 而非缺席。
+	if z := usage["charlie"]; z == nil || z.Today.Requests != 0 || z.Recent.Req != 0 || z.TTFB.Samples != 0 {
+		t.Fatalf("zero-activity row = %+v", z)
+	}
+}
+
+// TestUsageAttemptCauses 验证快照的 attempt_causes 段：被放弃 lane
+// 尝试的归因经 SwitchCauses 写路径落 lane_attempt_causes，UsageStats
+// 按 31 天本地日窗口直读投影（跨行同键累加）。
+func TestUsageAttemptCauses(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 钉在本地正午：跨午夜运行不会把日行拆到两个日期键。
+	today := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.Local)
+	todayDay := today.Format("2006-01-02")
+
+	// 两行各带一笔换号归因——attempt_causes 跨行按 (day,lane,cause) 累加。
+	for i := 0; i < 2; i++ {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("sr-%d", i), StartedAt: today, Result: "completed",
+			SwitchCauses: map[SwitchCause]int{{Lane: "alpha", Cause: "local_gate:latch"}: 1},
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.AttemptCauses) != 1 || snap.AttemptCauses[0].Date != todayDay ||
+		snap.AttemptCauses[0].Lane != "alpha" || snap.AttemptCauses[0].Cause != "local_gate:latch" ||
+		snap.AttemptCauses[0].N != 2 {
+		t.Fatalf("attempt_causes = %+v, want 今日 alpha/local_gate:latch n=2", snap.AttemptCauses)
+	}
+}
+
+// TestUsageSendsPerRow 验证快照的 sends_per_row 段：分子是 gate_windows
+// 按本地日聚合的放行数（used_fg+used_bg 跨 lane 合计），分母是当日
+// 非 rejected logs 行——纯探针日（无 logs 行）rows=0 且 ratio 缺省；
+// gate_windows 全期无行时整段缺席（omitempty 语义）。
+func TestUsageSendsPerRow(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	// 钉在本地正午：跨午夜运行不会把日行/窗行拆到两个日期键。
+	today := time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, time.Local)
+	yesterday := today.AddDate(0, 0, -1)
+	todayDay := today.Format("2006-01-02")
+
+	for i := 0; i < 2; i++ {
+		if _, err := s.InsertLog(ctx, &LogRow{
+			Dir: fmt.Sprintf("sr-%d", i), StartedAt: today, Result: "completed",
+		}); err != nil {
+			t.Fatalf("InsertLog: %v", err)
+		}
+	}
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.SendsPerRow) != 0 {
+		t.Fatalf("sends_per_row = %+v, want absent（gate_windows 无行）", snap.SendsPerRow)
+	}
+
+	// 今日 sends=4（跨 lane 合计：3fg+1bg，其中 retry_admits=1）；昨日
+	// sends=2 但无 logs 行——纯探针日进序列、ratio 缺省。
+	for _, w := range []*GateWindow{
+		{Lane: "alpha", WindowStart: today.Unix(), UsedFg: 3, UsedBg: 1, RetryAdmits: 1},
+		{Lane: "bravo", WindowStart: yesterday.Unix(), UsedFg: 2},
+	} {
+		if err := s.InsertGateWindow(ctx, w); err != nil {
+			t.Fatalf("InsertGateWindow: %v", err)
+		}
+	}
+	snap, err = s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.SendsPerRow) != 2 {
+		t.Fatalf("sends_per_row = %+v, want 昨日+今日两行", snap.SendsPerRow)
+	}
+	// 旧到新排序：昨日纯探针日 rows=0、ratio 缺省。
+	probe := snap.SendsPerRow[0]
+	if probe.Date != yesterday.Format("2006-01-02") || probe.Sends != 2 || probe.Rows != 0 || probe.Ratio != nil {
+		t.Fatalf("probe day = %+v, want sends=2 rows=0 ratio=nil", probe)
+	}
+	cur := snap.SendsPerRow[1]
+	if cur.Date != todayDay || cur.Sends != 4 || cur.Rows != 2 || cur.RetryAdmits != 1 || cur.Ratio == nil || *cur.Ratio != 2.0 {
+		t.Fatalf("today = %+v, want sends=4 rows=2 retry_admits=1 ratio=2.0", cur)
+	}
+}
+
+// TestUsageSendsCoverage 验证 sends_per_row 的 coverage/sends_missing：
+// coverage = 当日实有 lane-slot ÷ lanes × 当日已流逝分钟数（过去日 =
+// 整日长）。未装表日（只有 logs 行）coverage=0 标识「零发送」是结构
+// 伪影，部署截断式半覆盖日 coverage<1，全量日 coverage=1；缺窗不插值，
+// 差额落 sends_missing。分子剔保温 ping：used_bg_ping 不计入 sends。
+func TestUsageSendsCoverage(t *testing.T) {
+	s := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	yesterday := today.AddDate(0, 0, -1)
+	twoDaysAgo := today.AddDate(0, 0, -2)
+	threeDaysAgo := today.AddDate(0, 0, -3)
+
+	// 递归 CTE 一条 INSERT 铺连续分钟窗行：从 dayStart 起每分钟一条。
+	fill := func(lane string, dayStart time.Time, minutes int) {
+		if _, err := s.db.ExecContext(ctx,
+			`WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM c WHERE i < ?)
+			INSERT OR IGNORE INTO gate_windows (lane, window_start, used_fg)
+			SELECT ?, ? + i*60, 1 FROM c`, minutes-1, lane, dayStart.Unix()); err != nil {
+			t.Fatalf("fill gate_windows %s: %v", lane, err)
+		}
+	}
+	// 两 lane 前日全满（coverage=1）；昨日 a 全满 + b 前半日
+	//（real=2160 ÷ expected=2880 → coverage=0.75，missing=720）。
+	fill("a", twoDaysAgo, 1440)
+	fill("b", twoDaysAgo, 1440)
+	fill("a", yesterday, 1440)
+	fill("b", yesterday, 720)
+	// 今日 ping 行：used_bg=10 含 6 保温 ping——sends=2+(10-6)=6。
+	if err := s.InsertGateWindow(ctx, &GateWindow{
+		Lane: "a", WindowStart: today.Unix(),
+		UsedFg: 2, UsedBg: 10, UsedBgPing: 6,
+	}); err != nil {
+		t.Fatalf("InsertGateWindow: %v", err)
+	}
+	// 未装表日：三天前只有 logs 行；今日一行使今日进 union。
+	for _, r := range []*LogRow{
+		{Dir: "pre", StartedAt: threeDaysAgo, Result: "completed"},
+		{Dir: "cur", StartedAt: now, Result: "completed"},
+	} {
+		if _, err := s.InsertLog(ctx, r); err != nil {
+			t.Fatalf("InsertLog %s: %v", r.Dir, err)
+		}
+	}
+
+	snap, err := s.UsageStats(ctx)
+	if err != nil {
+		t.Fatalf("UsageStats: %v", err)
+	}
+	if len(snap.SendsPerRow) != 4 {
+		t.Fatalf("sends_per_row = %+v, want 四日", snap.SendsPerRow)
+	}
+	pre := snap.SendsPerRow[0]
+	if pre.Date != threeDaysAgo.Format("2006-01-02") || pre.Sends != 0 ||
+		pre.Coverage == nil || *pre.Coverage != 0 || pre.SendsMissing != 2880 {
+		t.Fatalf("pre-table day = %+v, want sends=0 coverage=0 missing=2880", pre)
+	}
+	full := snap.SendsPerRow[1]
+	if full.Date != twoDaysAgo.Format("2006-01-02") || full.Sends != 2880 ||
+		full.Coverage == nil || *full.Coverage != 1.0 || full.SendsMissing != 0 {
+		t.Fatalf("full day = %+v, want sends=2880 coverage=1 missing=0", full)
+	}
+	part := snap.SendsPerRow[2]
+	if part.Date != yesterday.Format("2006-01-02") || part.Sends != 2160 ||
+		part.Coverage == nil || *part.Coverage != 0.75 || part.SendsMissing != 720 {
+		t.Fatalf("partial day = %+v, want sends=2160 coverage=0.75 missing=720", part)
+	}
+	cur := snap.SendsPerRow[3]
+	if cur.Date != today.Format("2006-01-02") || cur.Sends != 6 {
+		t.Fatalf("today = %+v, want sends=6（ping 剔出分子）", cur)
+	}
+	// 今日期望 = lanes × 已流逝分钟——与实现同公式重算，只在校验与
+	// 调用落在同一分钟内才精确比对（跨分钟边界重跑断言无意义）。
+	if exp := int64(now.Truncate(time.Minute).Sub(today).Minutes()) * 2; exp > 0 &&
+		time.Now().Unix()/60 == now.Unix()/60 {
+		if cur.Coverage == nil || *cur.Coverage != 1.0/float64(exp) || cur.SendsMissing != exp-1 {
+			t.Fatalf("today coverage = %+v, want coverage=1/%d missing=%d", cur, exp, exp-1)
+		}
+	}
+}
+
+// TestGateExpectedSlots 钉住覆盖率期望的日界口径：当日已流逝分钟 =
+// now 整分下界 − 日界起点（14:30:45 → 870）；过去日按整日长（1440），
+// 期望随 lane 数线性；未来日、坏日期键与零 lane 返回 0（coverage
+// 未定义省略）。
+func TestGateExpectedSlots(t *testing.T) {
+	now := time.Date(2026, 9, 19, 14, 30, 45, 0, time.Local)
+	if got := gateExpectedSlots(now.Format("2006-01-02"), now, 2); got != 870*2 {
+		t.Fatalf("today = %d, want %d", got, 870*2)
+	}
+	if got := gateExpectedSlots(now.AddDate(0, 0, -1).Format("2006-01-02"), now, 2); got != 1440*2 {
+		t.Fatalf("yesterday = %d, want %d", got, 1440*2)
+	}
+	if got := gateExpectedSlots("2026-09-18", now, 1); got != 1440 {
+		t.Fatalf("single lane = %d, want 1440", got)
+	}
+	for _, day := range []string{"2999-01-01", "not-a-day"} {
+		if got := gateExpectedSlots(day, now, 2); got != 0 {
+			t.Fatalf("%q = %d, want 0", day, got)
+		}
+	}
+	if got := gateExpectedSlots("2026-09-18", now, 0); got != 0 {
+		t.Fatalf("zero lanes = %d, want 0", got)
+	}
+}

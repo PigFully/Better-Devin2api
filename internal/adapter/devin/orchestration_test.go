@@ -1,0 +1,899 @@
+// 编排层 in-process 上游测试：用 httptest + 生成的 Connect handler 把真
+// Adapter.Stream() 打到本地桩上，覆盖现有 receiver-fake 测试够不到的
+// New/attemptRunner.send/ensureCatalog/resolveModelRouting 链路与
+// 真实 HTTP 帧往返。与 cmd/upstreamstub 的区别：那里是外部进程打真实
+// 部署，这里是 per-test 进程内桩，断言能落到「第 N 次调用的 wire 请求」。
+package devin
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	devinproto "local/devinproto"
+	"local/devinproto/devinprotoconnect"
+
+	"connectrpc.com/connect"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/WncFht/devin2api/internal/debuglog"
+	"github.com/WncFht/devin2api/internal/llm"
+)
+
+// stubUpstream 实现 ApiServerServiceHandler：GetChatMessage 交给可替换的
+// 脚本函数（按调用序号分场景），GetCliModelConfigs 回固定目录，AssignModel
+// 回固定解析结果；其余 RPC 由嵌入的 Unimplemented 兜底。
+type stubUpstream struct {
+	devinprotoconnect.UnimplementedApiServerServiceHandler
+	// chat 是每次 GetChatMessage 的处理脚本；nil 时回 unimplemented。
+	chat func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error
+	// catalog 是 GetCliModelConfigs 返回的模型列表。
+	catalog []*devinproto.ExaCodeiumCommonPb_ClientModelConfig
+	// assign 是 AssignModel 的处理函数；nil 时回 unimplemented。
+	assign func(req *devinproto.AssignModelRequest) (*devinproto.AssignModelResponse, error)
+	// assignBlock/catalogBlock 非 nil 时对应 handler 派发脚本前先等它或
+	// ctx 关闭——模拟上游挂起；客户端 ctx 断（preGateTimeout 等）解开等待。
+	assignBlock  chan struct{}
+	catalogBlock chan struct{}
+
+	chatCalls    atomic.Int32
+	assignCalls  atomic.Int32
+	catalogCalls atomic.Int32
+	mu           sync.Mutex
+	// requests/auths 按调用次序记录 wire 请求与 Authorization 头，
+	// 供断言自愈换 token、continue 追加、router jwt 绑定等编排行为。
+	requests []*devinproto.GetChatMessageRequest
+	auths    []string
+}
+
+// GetChatMessage 记录请求后交给脚本；脚本返回的 error 直接成为 RPC 错误。
+func (stub *stubUpstream) GetChatMessage(ctx context.Context, req *connect.Request[devinproto.GetChatMessageRequest], stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+	call := int(stub.chatCalls.Add(1))
+	stub.mu.Lock()
+	stub.requests = append(stub.requests, req.Msg)
+	stub.auths = append(stub.auths, req.Header().Get("Authorization"))
+	stub.mu.Unlock()
+	if stub.chat == nil {
+		return connect.NewError(connect.CodeUnimplemented, errors.New("chat not scripted"))
+	}
+	return stub.chat(call, req.Msg, stream)
+}
+
+// GetCliModelConfigs 返回固定模型目录；catalogBlock 非 nil 时先挂起。
+func (stub *stubUpstream) GetCliModelConfigs(ctx context.Context, _ *connect.Request[devinproto.GetCliModelConfigsRequest]) (*connect.Response[devinproto.GetCliModelConfigsResponse], error) {
+	stub.catalogCalls.Add(1)
+	if stub.catalogBlock != nil {
+		select {
+		case <-stub.catalogBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return connect.NewResponse(&devinproto.GetCliModelConfigsResponse{ClientModelConfigs: stub.catalog}), nil
+}
+
+// AssignModel 把 router uid 解析为真实模型；无脚本时按 unimplemented
+// 失败；assignBlock 非 nil 时先挂起。
+func (stub *stubUpstream) AssignModel(ctx context.Context, req *connect.Request[devinproto.AssignModelRequest]) (*connect.Response[devinproto.AssignModelResponse], error) {
+	stub.assignCalls.Add(1)
+	if stub.assignBlock != nil {
+		select {
+		case <-stub.assignBlock:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if stub.assign == nil {
+		return nil, connect.NewError(connect.CodeUnimplemented, errors.New("assign not scripted"))
+	}
+	resp, err := stub.assign(req.Msg)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(resp), nil
+}
+
+// stubModelEntry 生成一条目录条目；router 为真时标 is_model_router。
+func stubModelEntry(uid string, router bool) *devinproto.ExaCodeiumCommonPb_ClientModelConfig {
+	entry := &devinproto.ExaCodeiumCommonPb_ClientModelConfig{
+		ModelUid:       proto.String(uid),
+		SupportsImages: proto.Bool(true),
+	}
+	if router {
+		entry.ModelInfo = &devinproto.ExaCodeiumCommonPb_ModelInfo{IsModelRouter: proto.Bool(true)}
+	}
+	return entry
+}
+
+// stubFrames 是脚本侧便捷构造器：元数据帧 / 文本增量 / stop 终止帧。
+func stubMeta() *devinproto.GetChatMessageResponse {
+	return &devinproto.GetChatMessageResponse{
+		MessageId: proto.String("bot-stub"),
+		RequestId: proto.String("stub-req"),
+		Timestamp: &devinproto.GoogleProtobuf_Timestamp{Seconds: proto.Int64(time.Now().Unix())},
+		Usage:     &devinproto.ExaCodeiumCommonPb_ModelUsageStats{ModelUid: proto.String("stub-model")},
+	}
+}
+
+func stubDelta(text string) *devinproto.GetChatMessageResponse {
+	return &devinproto.GetChatMessageResponse{DeltaText: proto.String(text)}
+}
+
+func stubStop() *devinproto.GetChatMessageResponse {
+	return &devinproto.GetChatMessageResponse{
+		StopReason: devinproto.ExaCodeiumCommonPb_StopReason_ExaCodeiumCommonPb_StopReason_STOP_REASON_STOP_PATTERN.Enum(),
+	}
+}
+
+// stubSend 依次写出脚本帧并正常收尾（connect-go 自动补 EndStream）。
+func stubSend(stream *connect.ServerStream[devinproto.GetChatMessageResponse], frames ...*devinproto.GetChatMessageResponse) error {
+	for _, f := range frames {
+		if err := stream.Send(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// stubEnvelope 编码一条 Connect 流式 envelope（raw 场景用）。
+func stubEnvelope(msg *devinproto.GetChatMessageResponse) []byte {
+	payload, err := proto.Marshal(msg)
+	if err != nil {
+		panic(err)
+	}
+	out := make([]byte, 5, 5+len(payload))
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(payload)))
+	return append(out, payload...)
+}
+
+// stubEndStream 编码流终止 envelope（0x02 标志 + JSON 尾帧体）。
+func stubEndStream(payload string) []byte {
+	out := make([]byte, 5, 5+len(payload))
+	out[0] = 0x02
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(payload)))
+	return append(out, payload...)
+}
+
+// stubServer 搭 in-process 上游：Connect handler 挂服务前缀，rawChat 非空时
+// 在 GetChatMessage 精确路径上覆盖一层裸 http.HandlerFunc（connect 的
+// ServerStream 表达不了「envelope 写一半断流」这类帧级故障）。
+func stubServer(t *testing.T, stub *stubUpstream, rawChat http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	path, handler := devinprotoconnect.NewApiServerServiceHandler(stub)
+	mux.Handle(path, handler)
+	if rawChat != nil {
+		mux.HandleFunc(devinprotoconnect.ApiServerServiceGetChatMessageProcedure, rawChat)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// stubAdapter 起指向 stub 的真 Adapter；Gate 零值 → quota<=0 直通不等待。
+func stubAdapter(t *testing.T, srv *httptest.Server, cfg Config) *Adapter {
+	t.Helper()
+	cfg.Endpoint.BaseURL = srv.URL
+	adapter, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(adapter.Close)
+	return adapter
+}
+
+// stubRequest 是最小合法中间请求：一条 user 文本。
+func stubRequest() llm.RequestMessages {
+	return llm.RequestMessages{
+		Messages: []llm.Message{llm.UserMessage{Content: []llm.Content{llm.TextContent{Text: "hi"}}}},
+	}
+}
+
+// stubDrain 消费事件流到 EOF，返回全部事件；中途出错即 fail。
+func stubDrain(t *testing.T, stream llm.ResponseStream) []llm.ResponseEvent {
+	t.Helper()
+	var events []llm.ResponseEvent
+	for {
+		event, err := stream.Recv(context.Background())
+		if errors.Is(err, io.EOF) {
+			return events
+		}
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		events = append(events, event)
+	}
+}
+
+// stubDeltas 汇合全部 delta 文本；最后一个事件应是 Done。
+func stubDeltas(t *testing.T, events []llm.ResponseEvent) (text string) {
+	t.Helper()
+	if len(events) == 0 {
+		t.Fatal("no events")
+	}
+	var b strings.Builder
+	for _, event := range events {
+		b.WriteString(event.Delta)
+	}
+	last := events[len(events)-1]
+	if last.Type != llm.ResponseEventDone || last.Reason != llm.StopReasonStop {
+		t.Fatalf("last event = %#v, want done/stop", last)
+	}
+	return b.String()
+}
+
+// TestOrchestrationHappyPath 验证完整链路：真实 Connect 建流 → 帧解码 →
+// 事件序列 → Done 聚合。
+func TestOrchestrationHappyPath(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			return stubSend(stream, stubMeta(), stubDelta("hello "), stubDelta("world"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "hello world" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if stub.chatCalls.Load() != 1 {
+		t.Fatalf("chat calls = %d", stub.chatCalls.Load())
+	}
+	if got := stub.requests[0].GetChatModelUid(); got != "stub-model" {
+		t.Fatalf("wire model = %q", got)
+	}
+}
+
+// TestOrchestrationUnauthenticatedSelfHeal 验证凭据自愈：首调用
+// unauthenticated → TokenSource 换新 token → 重发成功，且第二次 wire
+// 请求的 Authorization 确实换了。
+func TestOrchestrationUnauthenticatedSelfHeal(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			if call == 1 {
+				return connect.NewError(connect.CodeUnauthenticated, errors.New("stale token"))
+			}
+			return stubSend(stream, stubMeta(), stubDelta("ok"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	var sourceCalls atomic.Int32
+	adapter := stubAdapter(t, srv, Config{
+		Model: "stub-model",
+		Identity: LaneIdentity{
+			Token: "old",
+			TokenSource: func() string {
+				sourceCalls.Add(1)
+				return "new"
+			},
+		},
+	})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "ok" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if stub.chatCalls.Load() != 2 {
+		t.Fatalf("chat calls = %d, want 2", stub.chatCalls.Load())
+	}
+	if sourceCalls.Load() != 1 {
+		t.Fatalf("token source calls = %d, want 1", sourceCalls.Load())
+	}
+	if stub.auths[0] != "Basic old-old" || stub.auths[1] != "Basic new-new" {
+		t.Fatalf("auth headers = %q", stub.auths)
+	}
+}
+
+// TestOrchestrationUnauthenticatedSelfHealAtConnect 用裸 401 + connect JSON
+// 错误体验证非 200 响应的自愈。connect-go 的 CallServerStream 在 Send/
+// CloseRequest 后即返回，不等响应头——非 2xx 也推迟到首个 Receive 才暴露，
+// 所以本场景与 EndStream 尾帧错误一样走流内 reopen 分支；Stream() 层的
+// isUnauthenticated 重试只对「请求体发送期就失败」的形态可达（真实部署中
+// 如代理在转发前拒掉），spec 合规的 Connect 上游不会触发它。
+func TestOrchestrationUnauthenticatedSelfHealAtConnect(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+	}
+	good := append(append(append(stubEnvelope(stubMeta()), stubEnvelope(stubDelta("healed"))...), stubEnvelope(stubStop())...), stubEndStream("{}")...)
+	var rawCalls atomic.Int32
+	raw := func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		stub.chatCalls.Add(1)
+		stub.mu.Lock()
+		stub.auths = append(stub.auths, r.Header.Get("Authorization"))
+		stub.mu.Unlock()
+		if rawCalls.Add(1) == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"code":"unauthenticated","message":"stale token"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/connect+proto")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(good)
+	}
+	srv := stubServer(t, stub, raw)
+	adapter := stubAdapter(t, srv, Config{
+		Model: "stub-model",
+		Identity: LaneIdentity{
+			Token:       "old",
+			TokenSource: func() string { return "new" },
+		},
+	})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "healed" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if stub.chatCalls.Load() != 2 {
+		t.Fatalf("chat calls = %d, want 2", stub.chatCalls.Load())
+	}
+	if stub.auths[0] != "Basic old-old" || stub.auths[1] != "Basic new-new" {
+		t.Fatalf("auth headers = %q", stub.auths)
+	}
+}
+
+// TestOrchestrationTruncatedStreamReopens 验证 pre-content 传输截断续跑：
+// 第一次响应 envelope 写一半收尾（与 cmd/upstreamstub 的 precontent 同构），
+// 第二次返回完整流。走裸 handler——connect ServerStream 表达不了半帧。
+func TestOrchestrationTruncatedStreamReopens(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+	}
+	var rawCalls atomic.Int32
+	good := append(append(append(stubEnvelope(stubMeta()), stubEnvelope(stubDelta("recovered"))...), stubEnvelope(stubStop())...), stubEndStream("{}")...)
+	raw := func(w http.ResponseWriter, r *http.Request) {
+		stub.chatCalls.Add(1)
+		call := rawCalls.Add(1)
+		w.Header().Set("Content-Type", "application/connect+proto")
+		w.WriteHeader(http.StatusOK)
+		if call == 1 {
+			// 元数据帧 + 半截 envelope 前缀 → 客户端读帧器报 unexpected EOF。
+			_, _ = w.Write(append(stubEnvelope(stubMeta()), 0x00, 0x00))
+			return
+		}
+		_, _ = w.Write(good)
+	}
+	srv := stubServer(t, stub, raw)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "recovered" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if rawCalls.Load() != 2 {
+		t.Fatalf("chat calls = %d, want 2 (reopen)", rawCalls.Load())
+	}
+}
+
+// TestOrchestrationEmptyEndTurnContinues 验证空 end_turn 续跑：首流只有
+// stopReason 零内容 → adapter 追加 "continue" 用户消息重发 → 拿真内容。
+func TestOrchestrationEmptyEndTurnContinues(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			if call == 1 {
+				return stubSend(stream, stubMeta(), stubStop())
+			}
+			return stubSend(stream, stubMeta(), stubDelta("continued"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "continued" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if stub.chatCalls.Load() != 2 {
+		t.Fatalf("chat calls = %d, want 2", stub.chatCalls.Load())
+	}
+	// 第二次 wire 请求的 prompts 应多出 "continue" 用户消息。
+	raw, _ := protojson.Marshal(stub.requests[1])
+	if !strings.Contains(string(raw), "continue") {
+		t.Fatalf("second request missing continue: %s", raw)
+	}
+}
+
+// TestOrchestrationRateGateLocalReject 验证本地闸门归因：上游先回
+// resource_exhausted 上闩 → 下一请求被 gate.wait 快败，stage 记 rate_gate
+// 且 LocalGate 标记存在（请求未触达上游）。
+func TestOrchestrationRateGateLocalReject(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			return connect.NewError(connect.CodeResourceExhausted, errors.New("stub: rate limited"))
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	// 第一次：上游限流 → 上闩。server-stream 的 handler 错误经 EndStream
+	// 尾帧送达，从 Recv 侧暴露为 error 事件而不是 Stream() 的返回错误。
+	first, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("first Stream: %v", err)
+	}
+	var sawError bool
+	for {
+		event, recvErr := first.Recv(context.Background())
+		if errors.Is(recvErr, io.EOF) {
+			break
+		}
+		if recvErr != nil {
+			t.Fatalf("first Recv: %v", recvErr)
+		}
+		if event.Type == llm.ResponseEventError {
+			sawError = true
+		}
+	}
+	if !sawError {
+		t.Fatal("first stream should surface an error event")
+	}
+	if !adapter.GateStats().Latched {
+		t.Fatal("gate should be latched after upstream resource_exhausted")
+	}
+
+	// 第二次：带真 Recorder 验证 stage 归因 rate_gate。
+	manager := debuglog.NewManager(t.TempDir(), debuglog.RetentionPolicy{}, nil)
+	t.Cleanup(manager.Close)
+	recorder := manager.Start(debuglog.RequestMeta{Method: "POST", Path: "/v1/messages"})
+	ctx := debuglog.WithRecorder(context.Background(), recorder)
+	_, err = adapter.Stream(ctx, stubRequest())
+	if err == nil {
+		t.Fatal("second call should be gate-rejected")
+	}
+	failure := llm.Classify(err)
+	if !failure.LocalGate {
+		t.Fatalf("LocalGate = false: %+v", failure)
+	}
+	stage, _ := recorder.FirstError()
+	if stage != debuglog.ErrStageRateGate {
+		t.Fatalf("first error stage = %q, want %q", stage, debuglog.ErrStageRateGate)
+	}
+	recorder.Complete(debuglog.Completion{Result: "failed"})
+	// 闩内请求不该触达上游：chat 只被第一次调用打过。
+	if stub.chatCalls.Load() != 1 {
+		t.Fatalf("chat calls = %d, want 1 (gate fast-fail)", stub.chatCalls.Load())
+	}
+}
+
+// TestOrchestrationModelRouterAssign 验证 router uid 解析链：目录标
+// is_model_router → AssignModel → wire 请求带解析后 model uid 与 jwt。
+func TestOrchestrationModelRouterAssign(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("router-x", true)},
+		assign: func(req *devinproto.AssignModelRequest) (*devinproto.AssignModelResponse, error) {
+			return &devinproto.AssignModelResponse{
+				Assignment: &devinproto.ModelAssignment{
+					ModelUid:      proto.String("resolved-y"),
+					AssignmentJwt: proto.String("jwt-123"),
+				},
+			}, nil
+		},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			return stubSend(stream, stubMeta(), stubDelta("routed"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "router-x", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "routed" {
+		t.Fatalf("deltas = %q", got)
+	}
+	req := stub.requests[0]
+	if got := req.GetChatModelUid(); got != "resolved-y" {
+		t.Fatalf("wire model = %q, want resolved-y", got)
+	}
+	if got := req.GetModelAssignmentJwt(); got != "jwt-123" {
+		t.Fatalf("assignment jwt = %q", got)
+	}
+}
+
+// TestOrchestrationApplyConfig 验证热应用：运行时字段（model/token/闸门）
+// 换值即生效——下一次 Stream 的 wire 模型与 Authorization 同步切换；
+// 端点三件套不变时不触发调用束重建。
+func TestOrchestrationApplyConfig(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			return stubSend(stream, stubMeta(), stubDelta("x"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Identity: LaneIdentity{Name: "stub", Token: "tok"}, Model: "stub-model", Aliases: map[string]string{"a": "stub-model"}})
+
+	if adapter.TokenFunc()() != "tok" {
+		t.Fatal("TokenFunc should read current token")
+	}
+	if adapter.Aliases()["a"] != "stub-model" {
+		t.Fatal("Aliases should reflect config")
+	}
+	next := Config{
+		Identity: LaneIdentity{Name: "stub", Token: "tok2"},
+		Endpoint: Endpoint{BaseURL: srv.URL},
+		Model:    "other-model",
+		Aliases:  map[string]string{"b": "stub-model"},
+		Gate:     GateConfig{MaxRPM: 60},
+	}
+	applied, err := adapter.ApplyConfig(next)
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	for _, want := range []string{"devin.model", "devin.accounts.stub.token", "devin.aliases", "devin.max_rpm"} {
+		if !slices.Contains(applied, want) {
+			t.Fatalf("applied %v missing %q", applied, want)
+		}
+	}
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	stubDrain(t, stream)
+	if got := stub.requests[0].GetChatModelUid(); got != "other-model" {
+		t.Fatalf("wire model after ApplyConfig = %q", got)
+	}
+	if stub.auths[0] != "Basic tok2-tok2" {
+		t.Fatalf("auth after ApplyConfig = %q", stub.auths[0])
+	}
+}
+
+// TestApplyConfigSwitchesEndpoint 验证端点三件套热应用：base_url 换值触发
+// 调用束整体重建，下一次 Stream 落到新上游；构建失败（非法 proxy）时
+// 整体不提交——config 快照与调用束都留在旧端点。
+func TestApplyConfigSwitchesEndpoint(t *testing.T) {
+	chat := func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+		return stubSend(stream, stubMeta(), stubDelta("x"), stubStop())
+	}
+	catalog := []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("m", false)}
+	stub1 := &stubUpstream{catalog: catalog, chat: chat}
+	stub2 := &stubUpstream{catalog: catalog, chat: chat}
+	srv1 := stubServer(t, stub1, nil)
+	srv2 := stubServer(t, stub2, nil)
+	adapter := stubAdapter(t, srv1, Config{Model: "m", Identity: LaneIdentity{Token: "t"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	stubDrain(t, stream)
+	if stub1.chatCalls.Load() != 1 || stub2.chatCalls.Load() != 0 {
+		t.Fatalf("before reload: stub1=%d stub2=%d, want 1/0", stub1.chatCalls.Load(), stub2.chatCalls.Load())
+	}
+
+	// 非法 proxy 先行验证「构建失败整体不提交」：config 不换值、
+	// 调用束不换指针，后续请求仍落在当前端点。
+	if _, err := adapter.ApplyConfig(Config{Endpoint: Endpoint{BaseURL: srv2.URL, Proxy: "://bad-proxy"}, Model: "m", Identity: LaneIdentity{Token: "t"}}); err == nil {
+		t.Fatal("ApplyConfig with bad proxy should fail")
+	}
+	if got := adapter.CurrentConfig().Endpoint.BaseURL; got != srv1.URL {
+		t.Fatalf("config committed after failed rebuild: base_url=%q", got)
+	}
+
+	applied, err := adapter.ApplyConfig(Config{Endpoint: Endpoint{BaseURL: srv2.URL}, Model: "m", Identity: LaneIdentity{Token: "t"}})
+	if err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
+	}
+	if !slices.Contains(applied, "devin.base_url") {
+		t.Fatalf("applied %v missing devin.base_url", applied)
+	}
+
+	stream, err = adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream after endpoint swap: %v", err)
+	}
+	stubDrain(t, stream)
+	if stub1.chatCalls.Load() != 1 || stub2.chatCalls.Load() != 1 {
+		t.Fatalf("after reload: stub1=%d stub2=%d, want 1/1", stub1.chatCalls.Load(), stub2.chatCalls.Load())
+	}
+}
+
+// TestAssignModelPreGateTimeout 验证闸门前解析的硬顶：AssignModel 挂起时
+// 在飞 flight 与其全部等待者在 preGateTimeout 内拿到同一超时失败（不再
+// 陪跑到 api client 610s），失败形态是 failoverable 的
+// deadline_exceeded——号池下由兄弟 lane 重解析（见
+// TestPoolAssignModelTimeoutFailover）。
+func TestAssignModelPreGateTimeout(t *testing.T) {
+	defer func(d time.Duration) { preGateTimeout = d }(preGateTimeout)
+	preGateTimeout = 100 * time.Millisecond
+	stub := &stubUpstream{assignBlock: make(chan struct{})}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "m", Identity: LaneIdentity{Token: "tok"}})
+
+	// 首发把 flight 打挂在真实 RPC 上，再让同键等待者全部挂上 done。
+	ownerDone := make(chan error, 1)
+	go func() {
+		_, err := adapter.assignModel(context.Background(), "router-x", "cascade-1")
+		ownerDone <- err
+	}()
+	for stub.assignCalls.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	const waiters = 6
+	errs := make(chan error, waiters)
+	for i := 0; i < waiters; i++ {
+		go func() {
+			_, err := adapter.assignModel(context.Background(), "router-x", "cascade-1")
+			errs <- err
+		}()
+	}
+	started := time.Now()
+	for i := 0; i < waiters; i++ {
+		select {
+		case err := <-errs:
+			if !llm.Classify(err).Timeout {
+				t.Fatalf("waiter error = %v, want timeout failure", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("flight waiters not released within 5s")
+		}
+	}
+	select {
+	case err := <-ownerDone:
+		if !llm.Classify(err).Timeout {
+			t.Fatalf("owner error = %v, want timeout failure", err)
+		}
+		if !failoverable(context.Background(), err) {
+			t.Fatalf("assign timeout failure must be failoverable: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flight owner not released within 5s")
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("flight took %v, want ≈preGateTimeout", elapsed)
+	}
+	if got := stub.assignCalls.Load(); got != 1 {
+		t.Fatalf("AssignModel calls = %d, want 1 (flight dedup)", got)
+	}
+}
+
+// TestListModelsPreGateTimeout 验证目录拉取同受闸门前硬顶：
+// GetCliModelConfigs 挂起时 ListModels 在 preGateTimeout 内按超时失败进
+// 冷却——窗内后续调用直接吃 modelsErr，不二次打上游。
+func TestListModelsPreGateTimeout(t *testing.T) {
+	defer func(d time.Duration) { preGateTimeout = d }(preGateTimeout)
+	preGateTimeout = 100 * time.Millisecond
+	stub := &stubUpstream{catalogBlock: make(chan struct{})}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "m", Identity: LaneIdentity{Token: "tok"}})
+
+	_, err := adapter.ListModels(context.Background())
+	if err == nil || !llm.Classify(err).Timeout {
+		t.Fatalf("ListModels error = %v, want timeout failure", err)
+	}
+	if _, err := adapter.ListModels(context.Background()); err == nil {
+		t.Fatal("cooldown window should serve modelsErr")
+	}
+	if got := stub.catalogCalls.Load(); got != 1 {
+		t.Fatalf("GetCliModelConfigs calls = %d, want 1 (cooldown)", got)
+	}
+}
+
+// capacityError 构造 2026-09-25 生产事故的同款上游拒绝：serving 按模型
+// 维度拒单，顶 unimplemented code，message 带 "capacity issues" 指纹。
+func capacityError() error {
+	return connect.NewError(connect.CodeUnimplemented,
+		errors.New("We are currently experiencing capacity issues with this serving model. Please switch to a different model or try again later."))
+}
+
+// TestOrchestrationModelCapacityReopens 验证流内容量拒绝的整体重开吸收：
+// stub 前 3 次建流以容量错误收尾（Connect server-stream 的 handler 错误
+// 经 EndStream 尾帧送达，从泵侧而非 send 返回暴露），adapter 走
+// pre-content reopen 排队重打直到打穿——客户端只见一条成功流，
+// 拒绝事实落进模型拥塞簿记。
+func TestOrchestrationModelCapacityReopens(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			if call <= 3 {
+				return capacityError()
+			}
+			return stubSend(stream, stubMeta(), stubDelta("recovered"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "recovered" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if got := stub.chatCalls.Load(); got != 4 {
+		t.Fatalf("chat calls = %d, want 4 (3 rejections + recovery)", got)
+	}
+	adapter.congest.mu.Lock()
+	state, armed := adapter.congest.states["stub-model"]
+	adapter.congest.mu.Unlock()
+	if !armed {
+		t.Fatal("congestion state should be armed for the rejected model")
+	}
+	if state.episodes != 1 {
+		t.Fatalf("episodes = %d, want 1 (rejections share one sliding window)", state.episodes)
+	}
+	// 容量拒绝不是账号限流：闸门不闩、lane 不背冷却债。
+	if adapter.GateStats().Latched {
+		t.Fatal("capacity rejections must not latch the lane gate")
+	}
+}
+
+// TestOrchestrationModelCapacityClientCancel 验证客户端断连终止吸收：
+// stub 永续容量拒绝（pre-content 流不可脱钩），客户端 ctx 到期后泵被
+// cancel、流按 finish 事件队列收口到 EOF，上游调用不再增长——episode
+// 期间「无限续打」的终止界仍是调用方寿命。
+func TestOrchestrationModelCapacityClientCancel(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			return capacityError()
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	stream, err := adapter.Stream(ctx, stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	// 断连沿 ctx.Done 分支走 finish(ctx cause) 队列——消费到 EOF 即终局；
+	// 中途若返回真错误也算终止，两种形态都接受，唯独不许挂死。
+	deadline := time.Now().Add(5 * time.Second)
+	var sawError bool
+	for {
+		event, recvErr := stream.Recv(context.Background())
+		if recvErr != nil {
+			break
+		}
+		if event.Type == llm.ResponseEventError {
+			sawError = true
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream kept producing events after client death")
+		}
+	}
+	if !sawError {
+		t.Fatal("finish queue should carry the cancellation as an error event")
+	}
+	// 泵死后给一拍让在飞 resend 收尾，随后调用数必须冻结。
+	time.Sleep(50 * time.Millisecond)
+	frozen := stub.chatCalls.Load()
+	time.Sleep(150 * time.Millisecond)
+	if got := stub.chatCalls.Load(); got != frozen {
+		t.Fatalf("chat calls kept growing after client death: %d -> %d", frozen, got)
+	}
+}
+
+// TestOrchestrationModelCapacityOutlivesSilenceCap 验证容量吸收不被
+// pre-event 累计静默上限掐死：把上限压到 50ms，让 episode 实际跨越
+// ~150ms——每次容量拒绝都是上游的活跃应答，reopen 按应答时刻重锚
+// 静默簿记，而不是从首发累计到 180s 必死。
+func TestOrchestrationModelCapacityOutlivesSilenceCap(t *testing.T) {
+	defer func(d time.Duration) { upstreamPreEventSilenceCap = d }(upstreamPreEventSilenceCap)
+	upstreamPreEventSilenceCap = 50 * time.Millisecond
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			if call <= 5 {
+				// 30ms 的持有期让连续拒绝在首发锚点下累计超 50ms——
+				// 不重锚的话中途的 reopen 会以「静默耗尽」被拒收尾。
+				time.Sleep(30 * time.Millisecond)
+				return capacityError()
+			}
+			return stubSend(stream, stubMeta(), stubDelta("through"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	stream, err := adapter.Stream(context.Background(), stubRequest())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if got := stubDeltas(t, stubDrain(t, stream)); got != "through" {
+		t.Fatalf("deltas = %q", got)
+	}
+	if got := stub.chatCalls.Load(); got != 6 {
+		t.Fatalf("chat calls = %d, want 6", got)
+	}
+}
+
+// TestOrchestrationModelCapacitySharedQueue 验证拥塞期的多会话整形：
+// 4 条并发流同打一个持续拒绝的模型——在飞探针被 congest 槽闸到
+// cap=2，其余会话的重发排队补位，而不是各自连发；墙松后全部打穿，
+// 上游调用数有界。
+func TestOrchestrationModelCapacitySharedQueue(t *testing.T) {
+	stub := &stubUpstream{
+		catalog: []*devinproto.ExaCodeiumCommonPb_ClientModelConfig{stubModelEntry("stub-model", false)},
+		chat: func(call int, req *devinproto.GetChatMessageRequest, stream *connect.ServerStream[devinproto.GetChatMessageResponse]) error {
+			if call <= 5 {
+				return capacityError()
+			}
+			return stubSend(stream, stubMeta(), stubDelta("served"), stubStop())
+		},
+	}
+	srv := stubServer(t, stub, nil)
+	adapter := stubAdapter(t, srv, Config{Model: "stub-model", Identity: LaneIdentity{Token: "tok"}})
+
+	const sessions = 4
+	type result struct {
+		text string
+		err  error
+	}
+	results := make(chan result, sessions)
+	for i := 0; i < sessions; i++ {
+		go func() {
+			stream, err := adapter.Stream(context.Background(), stubRequest())
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			var events []llm.ResponseEvent
+			for {
+				event, recvErr := stream.Recv(context.Background())
+				if errors.Is(recvErr, io.EOF) {
+					break
+				}
+				if recvErr != nil {
+					results <- result{err: recvErr}
+					return
+				}
+				events = append(events, event)
+			}
+			var b strings.Builder
+			for _, event := range events {
+				b.WriteString(event.Delta)
+			}
+			results <- result{text: b.String()}
+		}()
+	}
+	for i := 0; i < sessions; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("session %d: %v", i, r.err)
+		}
+		if r.text != "served" {
+			t.Fatalf("session %d deltas = %q", i, r.text)
+		}
+	}
+	// 5 次拒绝 + 每会话各 1 次成功 = 9 发上限；远小于无整形的连打。
+	if got := stub.chatCalls.Load(); got > 5+sessions || got < sessions {
+		t.Fatalf("chat calls = %d, want within [%d, %d]", got, sessions, 5+sessions)
+	}
+}

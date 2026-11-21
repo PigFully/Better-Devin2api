@@ -1,0 +1,20 @@
+# GC 单周期耗时过长
+- alert: HighGCPauseTime
+  expr: rate(go_gc_duration_seconds_sum[5m]) / rate(go_gc_duration_seconds_count[5m]) > 0.01
+  for: 10m
+  annotations:
+    summary: "平均 GC 停顿 >10ms——减少分配或调 GOGC"
+
+# goroutine 泄漏
+- alert: GoroutineLeak
+  expr: go_goroutines > 10000
+  for: 5m
+  annotations:
+    summary: "goroutine 数 >10K——检查是否有泄漏的 goroutine"
+
+# 内存逼近容器限额
+- alert: MemoryNearLimit
+  expr: predict_linear(process_resident_memory_bytes[1h], 3600) > <container_limit_bytes>
+  for: 15m
+  annotations:
+    summary: "RSS 预计 1 小时内超过容器限额"

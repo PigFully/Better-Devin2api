@@ -1,0 +1,81 @@
+.DS_Store
+
+/protoextract
+/probe
+/bin/
+/work/
+# 现在是符号链接（指向平台状态目录下的 logs/）
+/logs
+/build/
+
+# 本地运行配置（含真实 devin token，不要提交）
+config.yaml
+
+# 编译产物
+/devin-2api
+/devin-2api.exe
+/devin-2api-linux-*
+
+# 调试/测试输出
+/outputs/*.json
+/outputs/*.txt
+/outputs/*.py
+# 性能快照与基准基线（可由 scripts/perf/snapshot.sh、scripts/perf/bench.sh 重新生成）
+/outputs/perf/
+/outputs/bench/
+
+# 生成代码已提交（outputs/devin-proto-go），clone 后可直接 go build；
+# 上游 proto 变化时用 task generate 重新生成并提交
+
+coverage.out
+*.test
+# probe 实验输出（可用 go run ./cmd/probe 重新生成）
+/outputs/probe/
+/outputs/probe-redo/
+
+/node_modules/
+multi-harness-eval/runs/
+
+# 任务运行中下载的媒体文件
+/downloads/
+
+# cliproxyapi 调研语料（~118MB，可由调研脚本重建；结论已沉淀进 notes/）
+/outputs/cliproxy-research/
+# 外部参考 clone（只读对照用，随时可重拉）
+/cliproxyapi/
+
+# 本地 agent 技能/配置（不入库）
+/.devin/
+
+# Claude Code 入口：CLAUDE.md 与 .claude/skills/ 均是指向 AGENTS.md / .agents/ 的软链
+/CLAUDE.md
+/.claude/
+
+# MPE 预览环境（parser.js/style.less/pseudocode 运行时）：本机目录，不入库
+/.crossnote/
+
+# 内部研究档案：上游逆向笔记、调研快照、本机部署/接入笔记（不随公开发布）
+/notes/
+
+# 本地分析副件：网关数据库快照（含明文凭据）与 scc 报告
+/data/
+/scc-report.html
+
+# 本地 scratch（实验/对照代码等杂项，不入库；.prettierignore 与
+# .markdownlint-cli2.jsonc 同步排除）
+/tmp/
+
+# Python 字节码缓存（scripts/quota/fit.py 等）
+__pycache__/
+
+# toolalign 实跑结果（可再生，不进库）
+/scripts/toolalign/results-*.jsonl
+
+/outputs/quota-probe-*.jsonl
+
+# panel-verify 前端验证套件：node 依赖与失败截图可再生
+/scripts/panel-verify/node_modules/
+/scripts/panel-verify/shots/
+
+# 面板截图审计产物（audit-shots.js 输出，可再生）
+/outputs/panel-shots/

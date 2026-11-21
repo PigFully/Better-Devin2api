@@ -1,0 +1,206 @@
+# devin-2api 配置模板。未注释的键是必填项或建议过一眼的最小面；
+# 注释掉的块全是可选调优（默认值已写在注释里，不取消即按默认走），
+# 不需要逐项打开。最小起步甚至可零编辑：devin.accounts 空池合法，
+# 先起服务再在面板 /web/accounts.html 加号，凭据到位即热上线。
+
+server:
+  listen: ":8080"
+  # 同时处理的 /v1/* 请求数上限；0 或不填表示使用默认值 1024。
+  max_concurrency: 1024
+
+debug:
+  # 请求级调试记录是本服务的排障基础：阶段记录（debug_files/debug_chunks
+  # 表）、logs 表、面板 usage/requests 全部依赖它，关闭则整套排障工作流
+  # 不可用。记录含请求正文，注意隐私与磁盘（上限由 max_total_mb 兜底）。
+  enabled: true
+  # 调试记录保留天数（按 dir 名内嵌时间整批清理）；<=0 不按时间清理。默认 14。
+  # retention_days: 14
+  # 调试 payload 总量上限（MB），超限按 dir 从最旧开始删；
+  # <=0 不限制。默认 1024。
+  # max_total_mb: 1024
+  # 大体积阶段记录（03-devin-request/04-devin-response/06-http-response 与
+  # attachments/ 名下的行）的保留小时数；超时剥离负载、保留
+  # meta/error/01/02/05 证据。<=0 不剥离。默认 24。
+  # payload_hours: 24
+  # 容量淘汰时保护的最新失败请求组数（含 error.json 行的 dir）；<=0 不保护。
+  # 默认 32。
+  # keep_error_dirs: 32
+  # 只保留失败请求的调试 payload：干净完成的请求完结即剥 payload
+  #（meta/error 锚点与 logs 摘要行照常保留），失败与可疑成功留全量——
+  # 大流量部署下调试库体积收敛到故障面。面板键 debug_log_errors_only
+  # 可热改。默认 false。
+  # errors_only: false
+  # logs 摘要行保留天数（独立于 payload 保留；payload 淘汰后行仍可归因）
+  # 由面板设置 log_row_retention_days 管理（settings 表覆盖键，不是本文件
+  # 的键——写进这里会被严格解析拒掉），默认 90、<=0 不清理。
+  # 配额快照采样间隔（分钟），写入 quota_samples 表供燃烧速率预测；<=0 不采样。
+  # 默认 5。
+  # quota_interval_minutes: 5
+  # pprof/fgprof 剖析端点的独立监听地址；空值不启用（默认）。
+  # 端点无鉴权——只绑回环地址，跨机访问走 ssh 端口转发。
+  # 开启时同时启用 block/mutex 剖析采样（带少量持续开销）。
+  # pprof_listen: "127.0.0.1:6060"
+
+devin:
+  base_url: "https://server.codeium.com"
+  # accounts: 上游账号池的声明基座（空集合法——可裸起服务后经面板
+  # /web/accounts.html 加号，凭据行落库成 panel 源）。面板改的 config
+  # 名生成覆盖行（面板值恒赢）、面板删的 config 名成墓碑压住声明。
+  # name 是账号在日志、闸门状态与面板里的身份：字母/数字/连字符/
+  # 下划线 1–32 字符、池内唯一；每号独立限速闸门（闩状态持久化在
+  # runtime_state 表的 gate:<name> 键）与配额采样。
+  # 凭据三选一（可叠加）：api_key 是 Devin 平台 durable key（cog_*，
+  # app.devin.ai → Settings → API keys 手工签发，无内嵌寿命、撤销才
+  # 失效）——上游判死时 lane 用它现场铸新 session token，是最省心的
+  # 来源；token 是字面量 session token（devin-session-token$*，寿命由
+  # 服务端管）；credentials_file 指向 Devin CLI 的 credentials.toml
+  # （解析 windsurf_api_key），CLI 续期改写它即自动跟随。同号多来源
+  # 时 token/文件先服役、api_key 兜底铸新。credentials_file 支持
+  # ~/ 展开，相对路径锚定本文件所在目录（不是进程 CWD）。两条目引用
+  # 同一有效 token、同一 credentials_file 或同一 api_key 按配置错误
+  # 拒绝。会话按亲和键钉选到号、失败按词表换号，
+  # 详见 docs/devin-accounts.md。
+  # 可选逐号字段：priority 是池级排序元数据（大的优先被新会话选中，
+  # 默认 0）；max_rpm 覆盖该号自己的分钟窗口配额（0 = 继承
+  # devin.max_rpm）。面板还可写 notes 备注与 credentials_content
+  # 粘贴上传。
+  # accounts:
+  #   - name: "main"
+  #     api_key: "cog_..."        # 推荐：durable key，自动铸 session token
+  #     priority: 10
+  #   - name: "backup"
+  #     token: "<backup 号 session token>"
+  #     credentials_file: "/home/user/.local/share/devin/credentials.toml"
+  # session_affinity_ttl_seconds: 3600  # 会话→lane 绑定的滑动 TTL（命中续期）
+  # quota_low_threshold_percent: 15     # weekly 配额低于此百分比时对新会话降权
+  # no_progress_timeout_seconds: 产出过内容后的上游无进度期限秒数，
+  #   须盖住工具参数阶段 15-25min 的静默计算。<=0 默认 2700（45min）。
+  # pre_event_no_progress_timeout_seconds: 产出首个事件前每段等待的
+  #   无进度期限秒数（pre 对偶档）。<=0 默认 600；pre-event 累计静默另
+  #   有内置 180s 硬顶（首发起算、跨重开累计），配大不突破该上限。
+  # no_progress_timeout_seconds: 2700
+  # pre_event_no_progress_timeout_seconds: 600
+  # model: "glm-5-2"
+  model: "swe-2-max"
+  # 代理地址（可选）；支持 http://、https://、socks5://、socks5h://
+  # 留空则直连或走系统环境变量 HTTP_PROXY/HTTPS_PROXY。
+  # proxy: "socks5://127.0.0.1:1080"
+  # 强制 HTTP/1.1：每请求独立 TCP 连接，避免 HTTP/2 单连接多 stream 复用
+  # 被上游串行处理导致并发卡住/首字延迟飙升。默认 true。
+  # 如上游不支持 HTTP/1.1 流式可设 false 回到 HTTP/2。
+  force_http1: true
+  # 客户端模型名 → 上游真实 UID 的别名映射（可选）。
+  # 例如客户端发 swe-2 / glm-5.2，上游实际 UID 是 swe-2-max / glm-5-2。
+  # 匹配顺序：精确命中 → 折叠命中（剥去 -/_/. 后小写化比较）→ "*"
+  # 兜底键（任意未命中名字都改写到其目标，适合客户端硬编码模型名的
+  # 场景）。链式映射在加载时自动展开到最终目标；空键/空目标/"*"
+  # 作目标/折叠等价重复键/环会拒绝启动。
+  # 别名也作用于请求缺省模型时的 devin.model；目标可以是 router uid
+  #（会自动走 AssignModel 解析）。别名条目出现在 /v1/models 列表里，
+  # 带 alias_of 标记，能力位继承自目标。
+  # aliases:
+  #   swe-2: "swe-2-max"
+  #   glm-5.2: "glm-5-2"
+  #   glm-5.3-max: "glm-5-3-max"
+  #   "*": "glm-5-2"
+  # 发给上游 metadata 的客户端身份；默认与真实 Devin CLI 抓包一致
+  #（chisel / 3000.2.17 / mac）。上游若给新模型加版本门（某模型突然
+  # not_found 或 permission_denied），bump client_version 即可，不必发版。
+  # client_name: "chisel"
+  # client_version: "3000.2.17"
+  # client_os: "mac"
+  # 发往上游 GetChatMessage 的消息速率上限（条/分钟），令牌桶实现、
+  # 桶容量为一分钟额度可容纳突发；<=0 或不填不限速——不建议：上游
+  # 限流器按分钟桶计数且把被拒尝试计入，不限速时突发容易触顶。
+  # 冷却闩本身始终生效（resource_exhausted 后按其 reset 时刻拦停，
+  # 闩截止时刻持久化在 devin-2api.db 的 runtime_state 表、重启恢复），
+  # max_rpm 决定的是触闩频率而不是兜底。
+  max_rpm: 80
+  # 上游限流冷却闩参数（通常无需调整）：
+  # gate_max_hold_seconds: 闩外令牌排队允许的最长等待秒数，超出快速
+  #   失败 429 + Retry-After。默认 30。
+  # gate_drip_interval_seconds: 闩内放行探针的间隔秒数——滴灌节奏
+  #   决定限流期间打到上游的速率与解闩探测频率。默认 8。
+  # gate_default_latch_seconds: 上游未声明 reset 时刻时的兜底闩时长
+  #   秒数。默认 60。
+  # gate_window_offset_seconds: 上游分钟桶界在本地分钟内的估计位置
+  #   （第几秒）；实测桶界在本地 :59 附近（上游时钟快 ~0.5s）。默认 0。
+  # gate_window_guard_seconds: 估计桶界两侧的停发死区秒数，覆盖桶界
+  #   估计误差与上游多分片漂移；死区内请求睡到下一窗口开放。默认 2。
+  # gate_cooldown_seconds: 解闩后配额爬坡时长——闩解除不等于上游余额
+  #   回血，爬坡期内有效配额从地板线性爬回 max_rpm，压住积压重试的
+  #   齐射。默认 180。
+  # gate_cooldown_floor_ratio: 爬坡起点配额比例（0~1），解闩后首个
+  #   窗口只放 floor×max_rpm。默认 0.2。
+  # gate_fragile_seconds: 脆弱期时长——上游限流判决或解闩后的一段
+  #   时间内，fg/bg 放行除窗口配额外还须过窗内线性额度（与 bg 爬坡
+  #   同式、不扣预留）：爬坡只限量不限速，开窗瞬间配额内排队仍会
+  #   齐射，深债期会被上游整排拒绝且每发续债。默认 600。
+  # 下游令牌可标 class=bg（无人值守批跑）走分级准入：bg 排队预算更长、
+  # 且被一道动态预留约束挡在 fg 保底余量之外——语义见 docs/gate-classes.md。
+  # gate_bg_max_hold_seconds: bg 请求的最长闸内排队秒数（fg 仍走
+  #   gate_max_hold_seconds）。默认 120。
+  # gate_bg_reserve_margin: bg 准入动态预留公式中的固定安全边际（条）。
+  #   默认 4。
+  # gate_max_hold_seconds: 30
+  # gate_drip_interval_seconds: 8
+  # gate_default_latch_seconds: 60
+  # gate_window_offset_seconds: 0
+  # gate_window_guard_seconds: 2
+  # gate_bg_max_hold_seconds: 120
+  # gate_bg_reserve_margin: 4
+  # gate_cooldown_seconds: 180
+  # gate_cooldown_floor_ratio: 0.2
+  # gate_fragile_seconds: 600
+  # 前缀保温（prefix-replay warming）：对保留的会话谱系按节拍重放最近
+  # 请求体，给上游 prompt cache 续期，压住 subagent 长时间等待结束后
+  # 恢复轮次的冷 prefill。默认关闭（灰度开关），其余参数通常无需调整：
+  # warm_prefix_interval_seconds: 每条保留谱系的 ping 节拍秒数；须明显
+  #   低于上游滑动 TTL（标称 ~780s、实测有效 ~690s），ping 只能续命
+  #   不能复活。默认 180。
+  # warm_prefix_jitter_ratio: 节拍 ±抖动比例，防同批静默谱系同刻齐射。
+  #   默认 0.15。
+  # warm_prefix_max_streams: 同时保留保温的谱系数上限。默认 256。
+  # warm_prefix_max_retained_mb: 保留请求体总量上限（MB），超限 LRU
+  #   驱逐。默认 96。
+  # warm_prefix_min_prefix_tokens: 可保温的最低前缀 token 数；以下冷
+  #   prefill 足够便宜，不值得烧 RPM。默认 8192。
+  # warm_prefix_blocked_max_idle_seconds: 有阻塞型 pending（agent/
+  #   task/wait 类）的谱系最长保温空闲秒数。默认 14400（4h）。
+  # warm_prefix_userpaced_max_idle_seconds: 无 pending 或仅剩用户节奏
+  #   pending（AskUserQuestion/ExitPlanMode/request_user_input）的最长
+  #   保温空闲秒数。默认 2700（45min）。
+  # warm_prefix_subdone_max_idle_seconds: 已完成 subagent 的复活长尾
+  #   保温空闲秒数。默认 600（10min）。
+  # warm_prefix_unknown_max_idle_seconds: 无会话标记流的兜底空闲秒数。
+  #   默认 1800。
+  # warm_prefix_blocked_names / warm_prefix_userpaced_names: pending
+  #   工具调用的两档分类名集；留空用内置默认
+  #   {Agent, Task, Workflow, wait_agent} 与
+  #   {AskUserQuestion, ExitPlanMode, request_user_input}。
+  # warm_prefix_enabled: false
+  # warm_prefix_interval_seconds: 180
+  # warm_prefix_jitter_ratio: 0.15
+  # warm_prefix_max_streams: 256
+  # warm_prefix_max_retained_mb: 96
+  # warm_prefix_min_prefix_tokens: 8192
+  # warm_prefix_blocked_max_idle_seconds: 14400
+  # warm_prefix_userpaced_max_idle_seconds: 2700
+  # warm_prefix_subdone_max_idle_seconds: 600
+  # warm_prefix_unknown_max_idle_seconds: 1800
+  # warm_prefix_blocked_names: [Agent, Task, Workflow, wait_agent]
+  # warm_prefix_userpaced_names:
+  #   [AskUserQuestion, ExitPlanMode, request_user_input]
+
+dashboard:
+  # 管理面板密码；留空则无需登录，直接进入 /web——server.listen 绑到
+  # 非回环地址（默认 :8080 是全部接口）时建议设置，否则面板对网络开放。
+  # 面板设置页可再设一个 DB 覆盖密码压过此值服役（严格覆盖，本值只做
+  # 应急找回层；忘密码时 sqlite3 删 runtime_state 的 dashboard.password_hash
+  # 行即回落此值，无需重启）。
+  password: ""
+
+# 下游令牌（/v1 准入凭据）只在面板管理：/web/tokens.html 创建，明文
+# 一次性出示，仓内只存哈希。令牌仓为空 = /v1 开放访问——server.listen
+# 绑到非回环地址（默认 :8080 是全部接口）时务必先建令牌再暴露端口。
+# 客户端经 Authorization: Bearer <token> 或 X-Api-Key 传递。

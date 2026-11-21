@@ -1,0 +1,3 @@
+interface:
+  display_name: "Go 专家"
+  short_description: "idiomatic Go、并发与 pprof 专长"

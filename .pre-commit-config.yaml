@@ -1,0 +1,37 @@
+repos:
+  # 顺序即语义：markdownlint --fix 原地修规则（改了就 fail 一次让你 re-add）→
+  # git-format-staged 链式 "autocorrect --stdin | prettier" 只写 index 收尾——
+  # commit 永远成功，混合暂存时未暂存的编辑不受污染。
+  # prettier / markdownlint-cli2 / gfs 版本以 package.json 为唯一事实源，
+  # 编辑器（prettierPath 指向同一处）与 hook 同源；autocorrect 走 brew，
+  # gfs 依赖系统 python3。
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: gofmt (staged content)
+        entry: ./node_modules/.bin/git-format-staged --formatter "gofmt"
+        language: system
+        types: [go]
+      - id: markdownlint-cli2
+        name: markdownlint-cli2 --fix
+        entry: ./node_modules/.bin/markdownlint-cli2 --fix
+        language: system
+        types: [markdown]
+      - id: prettier
+        name: autocorrect + prettier (staged content)
+        entry: ./node_modules/.bin/git-format-staged --formatter "autocorrect --stdin | ./node_modules/.bin/prettier --stdin-filepath {}"
+        language: system
+        types: [markdown]
+      # yaml 散文注释 ≤80 显示列（CJK 按 2 列计——yamllint 只数字符所以另写）。
+      # check 类、失败才拦；断点语义（从句边界）机检不了，靠人工。
+      - id: yaml-comment-width
+        name: yaml comment width (display cols)
+        entry: python3 scripts/check/yaml-comments.py
+        language: system
+        types: [yaml]
+  # secret 门控：GitHub push protection 只认标准 pattern，devin-session-token$
+  # 是本仓库最可能泄的自有格式，靠这里的自定义规则拦（见 .gitleaks.toml）。
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

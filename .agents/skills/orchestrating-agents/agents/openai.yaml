@@ -1,0 +1,3 @@
+interface:
+  display_name: "编排子代理"
+  short_description: "把大任务拆成子代理树"
